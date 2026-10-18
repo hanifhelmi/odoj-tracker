@@ -1,0 +1,19 @@
+---
+Task ID: 1-7 (full build, dieksekusi berurutan oleh agent utama)
+Agent: Z.ai Code (main agent)
+Task: Membangun aplikasi web Tilawah Tracker "One Day One Juz" dengan Google Sheet sebagai sumber jadwal (https://docs.google.com/spreadsheets/d/1N_8Nbr4bRQafoTN6TEkS9ZY0AOON3nS7BWQ1pU_GMws), sesuai user flow: dashboard → menu update progress → daftar nama hari ini → pilih tanggal (default hari ini) → update status (Belum/On Progress/Selesai) → simpan → popup "Barokallahu fii kum" → kembali ke dashboard.
+
+Work Log:
+- Task 1: Menganalisis struktur Google Sheet via CSV export (kolom: harike, haritgl, target, nama, status, timestamp; 8 peserta; 6 hari tercatat). Menyusun prisma/schema.prisma (TilawahEntry = cache sheet, LocalUpdate = overlay update dari app, SyncMeta = lastSyncAt) dan menjalankan `bun run db:push`.
+- Task 2: Membuat src/lib/tilawah.ts (tipe bersama, parser CSV quote-aware, normalisasi tanggal multi-format "30-Sep-2026" | "10/18/2026" | ISO, parser target "3B" → juz+bagian, formatter Indonesia, todayJakarta()) dan src/lib/tilawah-server.ts (syncFromSheet dengan cache 3 menit + force, merge sheet+local untuk status efektif, buildDashboard agregat, buildDayResponse, saveProgress upsert transactional).
+- Task 3: Membuat API routes: POST /api/sync?force=1, GET /api/dashboard?date=, GET /api/day?date=|harike=, POST /api/progress (semua force-dynamic, pakai API route bukan server action).
+- Task 4: Frontend dashboard (src/components/tilawah/dashboard-view.tsx): hero banner progres tim, 4 stat cards (posisi program, capaian hari ini, juz terkumpul, peserta aktif), ranking pencapaian per peserta dengan progress bar + badge status hari ini, timeline aktivitas terakhir, matriks capaian harian (peserta × hari) dengan legend.
+- Task 5: Frontend update progress (src/components/tilawah/update-view.tsx): date picker Popover+Calendar default hari ini, Select "hari ke-N" untuk navigasi semua jadwal, banner saran otomatis bila tanggal tanpa jadwal (menunjuk hari terdekat yang belum selesai), daftar peserta dengan segmented control 3 status (Belum/On Progress/Selesai), bar simpan sticky, popup Dialog "Barokallahu fii kum" dengan tombol Kembali ke Dashboard. Shell app (src/app/page.tsx): header sticky + nav 2 menu + tombol sinkron manual + footer sticky, view switching via AnimatePresence (single route "/" sesuai aturan).
+- Task 6: Fix lint (setState-in-effect → pola penyesuaian state saat render; Select uncontrolled→controlled), lint bersih. Verifikasi E2E via agent-browser: dashboard render (desktop 1280px & mobile 375px), klik Update Progress, ubah status 2 peserta → Simpan → popup muncul → Kembali ke Dashboard (capaian hari ini berubah 0/8→1/8), banner saran tanggal 25 Okt muncul dan tombol "Buka Hari ke-5" berfungsi, footer menempel saat scroll, tanpa page error. Data test di-reset ke kondisi asli sheet (hari 6 semua Belum).
+
+Stage Summary:
+- Aplikasi live di route "/" (dev server port 3000), single-page dengan 2 view: Dashboard & Update Progress.
+- Arsitektur data: Google Sheet = sumber jadwal (auto-sync tiap 3 menit / tombol sinkron / saat DB kosong); SQLite+Prisma menyimpan cache sheet + overlay LocalUpdate sehingga update via app selalu menang dan tidak pernah tertimpa re-sync.
+- Kontrak API: /api/dashboard, /api/day, /api/progress, /api/sync (JSON).
+- Keputusan penting: (1) tulis ke Google Sheet langsung tidak memungkinkan tanpa OAuth/service account, sehingga update status disimpan di SQLite sebagai overlay di atas data sheet; (2) tanggal sheet multi-format dinormalisasi ke ISO; (3) hari "posisi program" = hari terdekat yang belum semua Selesai; (4) hari "hari ini" = hari yang tanggalnya sama dengan hari ini (Asia/Jakarta).
+- Verifikasi: lint bersih, API 200 semua endpoint, E2E golden path lulus via agent-browser, footer sticky OK, responsif OK, tanpa error runtime/console.

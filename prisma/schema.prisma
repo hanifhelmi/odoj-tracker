@@ -1,0 +1,48 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// Tilawah Tracker — One Day One Juz
+// Sumber jadwal: Google Sheet (kolom: harike, haritgl, target,
+// nama, status, timestamp). Di-sync ke SQLite sebagai cache lokal.
+// ============================================================
+
+// Baris jadwal + status yang berasal dari Google Sheet
+model TilawahEntry {
+  id             Int     @id @default(autoincrement())
+  harike         Int // nomor urut hari program (1..60)
+  tanggal        String? // tanggal jadwal, dinormalisasi ISO yyyy-MM-dd
+  target         String // target bacaan: "1A", "1B", "2A", ...
+  nama           String // nama peserta
+  sheetStatus    String  @default("Belum") // status dari sheet
+  sheetTimestamp String? // timestamp dari sheet (ISO)
+
+  @@unique([harike, nama])
+  @@index([tanggal])
+  @@index([nama])
+}
+
+// Update status yang dilakukan lewat aplikasi web (overlay di atas sheet)
+model LocalUpdate {
+  id        Int      @id @default(autoincrement())
+  harike    Int
+  nama      String
+  status    String // Belum | On Progress | Selesai
+  updatedAt DateTime @updatedAt
+
+  @@unique([harike, nama])
+  @@index([harike])
+}
+
+// Metadata sinkronisasi (lastSyncAt, dll)
+model SyncMeta {
+  id    Int    @id @default(autoincrement())
+  key   String @unique
+  value String
+}
