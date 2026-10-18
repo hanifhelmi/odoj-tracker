@@ -71,7 +71,7 @@ export interface DashboardData {
   progressKeseluruhan: number // 0..100
   hariIni: DayInfo | null // hari yang bertanggal hari ini
   selesaiHariIni: number
-  posisiProgram: DayInfo | null // hari terdekat yang belum selesai semua
+  posisiProgram: DayInfo | null // hari yang bertanggal hari ini (haritgl == today); fallback: tanggal terdekat
   sisaDiPosisi: number // jumlah peserta yang belum selesai di posisiProgram
   peserta: ParticipantStats[]
   matriks: MatrixColumn[]

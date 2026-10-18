@@ -96,10 +96,20 @@ function HeroBanner({ data }: { data: DashboardData }) {
       <p className="mt-2 max-w-xl text-sm text-emerald-50/90">
         {posisi ? (
           <>
-            Saat ini program berada pada <span className="font-semibold text-white">hari ke-{posisi.harike}</span>{' '}
-            dengan target <span className="font-semibold text-white">Juz {posisi.juz} Bagian {posisi.bagian}</span>.
-            Masih ada <span className="font-semibold text-white">{data.sisaDiPosisi} peserta</span> yang belum
-            menyelesaikan target ini.
+            Saat ini program berada pada <span className="font-semibold text-white">hari ke-{posisi.harike}</span>
+            {posisi.tanggal ? <> ({formatTanggal(posisi.tanggal)})</> : null} dengan target{' '}
+            <span className="font-semibold text-white">
+              Juz {posisi.juz} Bagian {posisi.bagian}
+            </span>
+            .{' '}
+            {data.sisaDiPosisi > 0 ? (
+              <>
+                Masih ada <span className="font-semibold text-white">{data.sisaDiPosisi} peserta</span> yang belum
+                menyelesaikan target ini.
+              </>
+            ) : (
+              <>Masya Allah, seluruh peserta sudah menyelesaikan target hari ke-{posisi.harike}. Barokallahu fiikum!</>
+            )}
           </>
         ) : (
           <>Masya Allah, seluruh jadwal yang tercatat sudah diselesaikan semua peserta. Barokallahu fiikum!</>
@@ -147,7 +157,7 @@ function StatCards({ data }: { data: DashboardData }) {
       label: 'Posisi Program',
       value: data.posisiProgram ? `Hari ke-${data.posisiProgram.harike}` : 'Selesai',
       sub: data.posisiProgram
-        ? `Target ${data.posisiProgram.target} • Juz ${data.posisiProgram.juz} ${data.posisiProgram.bagian === 'A' ? 'awal' : 'akhir'}`
+        ? `${data.posisiProgram.tanggal ? `${formatTanggal(data.posisiProgram.tanggal)} • ` : ''}Target ${data.posisiProgram.target}`
         : 'Semua jadwal tuntas',
       tone: 'text-emerald-600 bg-emerald-50',
     },

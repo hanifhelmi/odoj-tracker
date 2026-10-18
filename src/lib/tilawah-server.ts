@@ -7,6 +7,7 @@ import { db } from '@/lib/db'
 import {
   SHEET_CSV_URL,
   SYNC_INTERVAL_MS,
+  todayJakarta,
   type AktivitasItem,
   type DashboardData,
   type DayEntry,
@@ -145,6 +146,9 @@ export async function buildDashboard(hariIniISO: string | null): Promise<Dashboa
   const rows = await getEffectiveRows()
   const lastSync = await db.syncMeta.findUnique({ where: { key: 'lastSyncAt' } })
 
+  // "Hari ini" (Asia/Jakarta) — pakai param ?date bila ada, bila tidak hitung sendiri
+  const todayISO = hariIniISO?.trim() || todayJakarta()
+
   const names = [...new Set(rows.map((r) => r.nama))].sort((a, b) =>
     a.localeCompare(b, 'id'),
   )
@@ -160,27 +164,50 @@ export async function buildDashboard(hariIniISO: string | null): Promise<Dashboa
   const totalSelesai = rows.filter((r) => r.status === 'Selesai').length
   const totalTarget = rows.length
 
-  // Hari yang bertanggal hari ini
-  const hariIniRow = hariIniISO
-    ? rows.find((r) => r.tanggal === hariIniISO)
-    : undefined
+  // Hari yang bertanggal hari ini (haritgl == today)
+  const hariIniRow = rows.find((r) => r.tanggal === todayISO)
   const hariIni = hariIniRow ? dayInfos.get(hariIniRow.harike) ?? null : null
   const selesaiHariIni = hariIniRow
     ? rows.filter((r) => r.harike === hariIniRow.harike && r.status === 'Selesai').length
     : 0
 
-  // Posisi program: hari paling awal yang belum semua Selesai
-  let posisiProgram: DayInfo | null = null
-  let sisaDiPosisi = 0
-  for (const h of harikeList) {
-    const dayRows = rows.filter((r) => r.harike === h)
-    const belum = dayRows.filter((r) => r.status !== 'Selesai').length
-    if (belum > 0) {
-      posisiProgram = dayInfos.get(h) ?? null
-      sisaDiPosisi = belum
-      break
+  // Posisi program = hari yang bertanggal HARI INI (match haritgl == today, Asia/Jakarta)
+  let posisiProgram: DayInfo | null = hariIniRow ? dayInfos.get(hariIniRow.harike) ?? null : null
+
+  // Fallback bila tidak ada baris bertanggal hari ini:
+  // ambil hari dengan tanggal terdekat dari hari ini (prioritas tanggal terakhir <= hari ini,
+  // bila tidak ada → tanggal paling awal setelah hari ini, mis. program belum mulai)
+  if (!posisiProgram) {
+    const dated = [...dayInfos.values()]
+      .filter((d): d is DayInfo & { tanggal: string } => Boolean(d.tanggal))
+      .sort((a, b) => (a.tanggal < b.tanggal ? -1 : a.tanggal > b.tanggal ? 1 : 0))
+    if (dated.length > 0) {
+      let lewat: (DayInfo & { tanggal: string }) | undefined
+      for (let i = dated.length - 1; i >= 0; i--) {
+        if (dated[i].tanggal <= todayISO) {
+          lewat = dated[i]
+          break
+        }
+      }
+      posisiProgram = lewat ?? dated[0] ?? null
     }
   }
+
+  // Fallback terakhir (sheet tanpa tanggal sama sekali): hari paling awal yang belum semua Selesai
+  if (!posisiProgram) {
+    for (const h of harikeList) {
+      const dayRows = rows.filter((r) => r.harike === h)
+      if (dayRows.some((r) => r.status !== 'Selesai')) {
+        posisiProgram = dayInfos.get(h) ?? null
+        break
+      }
+    }
+  }
+
+  // Sisa peserta yang belum menyelesaikan target pada posisi program
+  const sisaDiPosisi = posisiProgram
+    ? rows.filter((r) => r.harike === posisiProgram!.harike && r.status !== 'Selesai').length
+    : 0
 
   // Statistik per peserta
   const peserta: ParticipantStats[] = names.map((nama) => {
@@ -310,12 +337,23 @@ export async function buildDayResponse(params: {
       : undefined
   }
 
-  // Saran: hari paling awal yang belum selesai semua
+  // Saran: prioritas hari yang bertanggal HARI INI bila masih ada yang belum selesai,
+  // selain itu hari paling awal yang belum selesai semua
+  const todayISO = todayJakarta()
+  const todayRow = rows.find((r) => r.tanggal === todayISO)
   let suggestion: DayInfo | null = null
-  for (const [h, dayRowsAll] of [...byDay.entries()].sort((a, b) => a[0] - b[0])) {
-    if (dayRowsAll.some((r) => r.status !== 'Selesai')) {
-      suggestion = toDayInfo(h, dayRowsAll[0]?.tanggal ?? null, dayRowsAll[0]?.target ?? '')
-      break
+  if (todayRow) {
+    const todayRowsAll = byDay.get(todayRow.harike) ?? []
+    if (todayRowsAll.some((r) => r.status !== 'Selesai')) {
+      suggestion = toDayInfo(todayRow.harike, todayRow.tanggal, todayRow.target)
+    }
+  }
+  if (!suggestion) {
+    for (const [h, dayRowsAll] of [...byDay.entries()].sort((a, b) => a[0] - b[0])) {
+      if (dayRowsAll.some((r) => r.status !== 'Selesai')) {
+        suggestion = toDayInfo(h, dayRowsAll[0]?.tanggal ?? null, dayRowsAll[0]?.target ?? '')
+        break
+      }
     }
   }
 

@@ -35,3 +35,21 @@ Stage Summary:
 - Jika belum terhubung: data tetap tersimpan di app (tidak hilang) dengan banner peringatan; begitu terhubung, semua perubahan tertunda otomatis terkirim (juga tersedia tombol Kirim Ulang).
 - Kolom sheet yang ditulis: E (status) & F (timestamp, M/d/yyyy Asia/Jakarta); pencarian baris berdasarkan A (harike) + D (nama) — cocok dengan struktur sheet asli.
 - State akhir: LocalUpdate kosong, koneksi belum diisi (menunggu setup admin), DB tersinkron dengan sheet terbaru (152 baris, 19 hari).
+
+---
+Task ID: Fix 2
+Agent: Z.ai Code (main agent)
+Task: Perbaikan dashboard — widget "Posisi Program Hari Ke xxx" dan caption hero belum akurat; harus di-match-kan dengan harike di mana haritgl = today (Asia/Jakarta).
+
+Work Log:
+- Analisis: buildDashboard lama menghitung posisiProgram = "hari paling awal yang belum semua Selesai" → saat sheet berubah (pemilik menambah jadwal hari 1-19, 9 peserta, 171 baris; hari ini 18 Okt 2026 = hari ke-19 target 10A), widget tetap menunjuk hari ke-5 (sisa 7 peserta).
+- src/lib/tilawah-server.ts (buildDashboard): posisiProgram kini = hari yang bertanggal HARI INI (match haritgl == today, todayISO = param ?date atau todayJakarta()). Fallback berlapis bila tanggal hari ini tidak ada di sheet: (1) tanggal terdekat — prioritas tanggal terakhir <= hari ini, jika tidak ada → tanggal paling awal > hari ini (program belum mulai); (2) sheet tanpa tanggal sama sekali → hari paling awal yang belum semua Selesai. sisaDiPosisi dihitung dari hari posisiProgram (status !== 'Selesai').
+- src/lib/tilawah-server.ts (buildDayResponse): suggestion banner "tanggal tanpa jadwal" kini juga memprioritaskan hari yang bertanggal hari ini (bila masih ada yang belum selesai), fallback ke hari paling awal yang belum selesai.
+- src/components/tilawah/dashboard-view.tsx: caption hero kini menyertakan tanggal — "Saat ini program berada pada hari ke-N (tanggal) dengan target Juz X Bagian Y" + teks khusus bila sisa = 0 ("Masya Allah, seluruh peserta sudah menyelesaikan target..."). Kartu "Posisi Program" sub jadi "18 Okt 2026 • Target 10A" (tanggal ditambahkan; bagian "Juz X awal/akhir" dipangkas agar tidak terpotong truncate).
+- src/lib/tilawah.ts: komentar tipe posisiProgram diperbarui.
+- Verifikasi: lint bersih; force sync (171 baris, 9 peserta); API: ?date=2026-10-18 → posisi hari ke-19 target 10A sisa 6 & selesaiHariIni 3/9 (sesuai sheet live); ?date=2026-12-25 → fallback hari 19; ?date=2026-09-01 → fallback hari 1 (program belum mulai); tanpa param → default todayJakarta() hari 19; /api/day?date=2026-10-25 → suggestion hari 19. Browser E2E: hero caption benar, kartu Posisi Program "Hari ke-19 / 18 Okt 2026 • Target 10A", Capaian Hari Ini 3/9, mobile 375px rapi, footer sticky (footerBottom = viewport), Update Progress tetap berfungsi (hari ke-19, banner saran tersembunyi bila jadwal ada), console tanpa error.
+
+Stage Summary:
+- Posisi program di seluruh dashboard kini selalu = baris sheet dengan haritgl == hari ini (Asia/Jakarta), bukan lagi hari-unfinished terawal; caption hero dan kartu statistik konsisten dengan logika tersebut.
+- Aman untuk tanggal tanpa jadwal (fallback tanggal terdekat) dan sheet tanpa kolom tanggal (fallback hari-unfinished terawal).
+- Tidak ada perubahan skema DB / API contract; perubahan murni logika agregasi + tampilan.
