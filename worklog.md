@@ -17,3 +17,21 @@ Stage Summary:
 - Kontrak API: /api/dashboard, /api/day, /api/progress, /api/sync (JSON).
 - Keputusan penting: (1) tulis ke Google Sheet langsung tidak memungkinkan tanpa OAuth/service account, sehingga update status disimpan di SQLite sebagai overlay di atas data sheet; (2) tanggal sheet multi-format dinormalisasi ke ISO; (3) hari "posisi program" = hari terdekat yang belum semua Selesai; (4) hari "hari ini" = hari yang tanggalnya sama dengan hari ini (Asia/Jakarta).
 - Verifikasi: lint bersih, API 200 semua endpoint, E2E golden path lulus via agent-browser, footer sticky OK, responsif OK, tanpa error runtime/console.
+
+---
+Task ID: Fix 1-5
+Agent: Z.ai Code (main agent)
+Task: Perbaikan — "Update Progress per peserta BELUM mengupdate data di Google Sheet". Implementasi penulisan langsung (write-through) ke Google Sheet.
+
+Work Log:
+- Fix 1: Analisis akar masalah — Google tidak mengizinkan penulisan ke Sheet dari server pihak ketiga tanpa otorisasi pemilik. Solusi standar: jembatan Google Apps Script Web App (dideploy pemilik sheet sekali, akses "Anyone", execute as "Me"). Schema: tambah kolom `sheetSynced Boolean @default(false)` di LocalUpdate + db push + bersihkan data lama.
+- Fix 2: Backend — src/lib/tilawah.ts: tambah APPS_SCRIPT_CODE (kode Code.gs siap tempel: doPost mencari baris by harike+nama, menulis kolom E=status & F=timestamp format M/d/yyyy Asia/Jakarta, doGet untuk uji koneksi), tipe PushResult & SheetSettings. src/lib/tilawah-server.ts: getSheetSettings, saveSheetUrl (validasi format /exec + uji GET 15s), clearSheetUrl, pushPendingToSheet (POST batch semua LocalUpdate sheetSynced=false, timeout 20s, tandai per-baris berdasarkan results[].ok). saveProgress kini: upsert (sheetSynced=false) → pushPendingToSheet() → kembalikan { ...day, push }.
+- Fix 3: API baru — GET/POST/DELETE /api/settings (POST juga langsung push pending setelah terhubung), POST /api/push (kirim ulang). Frontend — komponen sheet-setup-dialog.tsx: dialog setup 4 langkah bernomor + link buka Sheet + kode Code.gs dengan tombol Salin + input Web App URL + Uji Koneksi & Simpan + Putuskan Koneksi (zustand store openSheetSetup). SheetConnectionBanner: amber bila belum terhubung / teal bila ada baris belum terkirim + tombol Kirim Ulang. Popup "Barokallahu fii kum" kini menampilkan status penulisan ke Sheet: hijau "N status berhasil ditulis ke Google Sheet", atau peringatan + tombol kirim ulang / ajakan hubungkan. Header: tombol amber "Hubungkan Sheet" bila belum terhubung.
+- Fix 4: Lint bersih. Restart dev server (Prisma client reload untuk kolom baru). Uji E2E dengan mock Apps Script (bun server :4444): POST /api/progress → push.ok=true pushed=2, mock menerima "6|Freddi|Selesai" & "6|Reza|On Progress", DB sheetSynced=true, /api/push retry pushed=0. Browser: popup menampilkan "✅ 1 status berhasil ditulis ke Google Sheet"; dialog setup tampil sempurna dari tombol header; banner belum-terhubung OK. Cleanup data uji + mock + koneksi.
+- Temuan saat pengujian: pemilik sheet telah menambah jadwal (48 → 152 baris, hari 1-19 dengan tanggal berurutan; hari ini 18 Okt 2026 = hari ke-19 target 10A). Aplikasi otomatis mengikuti via sync — perilaku benar. Force sync dijalankan, data terbaru 152 baris termuat.
+
+Stage Summary:
+- Update status via aplikasi kini WRITE-THROUGH ke Google Sheet (begitu admin menyelesaikan setup Apps Script sekali: salin kode → deploy Web App (Me/Anyone) → tempel URL /exec di dialog Hubungkan Sheet).
+- Jika belum terhubung: data tetap tersimpan di app (tidak hilang) dengan banner peringatan; begitu terhubung, semua perubahan tertunda otomatis terkirim (juga tersedia tombol Kirim Ulang).
+- Kolom sheet yang ditulis: E (status) & F (timestamp, M/d/yyyy Asia/Jakarta); pencarian baris berdasarkan A (harike) + D (nama) — cocok dengan struktur sheet asli.
+- State akhir: LocalUpdate kosong, koneksi belum diisi (menunggu setup admin), DB tersinkron dengan sheet terbaru (152 baris, 19 hari).

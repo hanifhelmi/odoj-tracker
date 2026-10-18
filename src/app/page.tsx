@@ -6,6 +6,7 @@ import { AnimatePresence, motion } from 'framer-motion'
 import {
   BookOpenText,
   LayoutDashboard,
+  Link2,
   RefreshCw,
   SquarePen,
 } from 'lucide-react'
@@ -15,6 +16,11 @@ import { cn } from '@/lib/utils'
 import { SHEET_WEB_URL } from '@/lib/tilawah'
 import { DashboardView } from '@/components/tilawah/dashboard-view'
 import { UpdateView } from '@/components/tilawah/update-view'
+import {
+  SheetSetupDialog,
+  openSheetSetup,
+  useSheetSettings,
+} from '@/components/tilawah/sheet-setup-dialog'
 
 type View = 'dashboard' | 'update'
 
@@ -23,6 +29,7 @@ export default function Home() {
   const [refreshKey, setRefreshKey] = useState(0)
   const queryClient = useQueryClient()
   const { toast } = useToast()
+  const sheetSettings = useSheetSettings()
 
   const syncMutation = useMutation({
     mutationFn: async () => {
@@ -99,6 +106,19 @@ export default function Home() {
               </button>
             </nav>
 
+            {/* Hubungkan Google Sheet (bila belum terhubung) */}
+            {sheetSettings.data && !sheetSettings.data.connected && (
+              <Button
+                variant="outline"
+                onClick={openSheetSetup}
+                title="Hubungkan aplikasi ke Google Sheet agar update status ikut menulis ke Sheet"
+                className="min-h-[44px] shrink-0 border-amber-300 bg-amber-50 text-xs font-semibold text-amber-800 hover:bg-amber-100"
+              >
+                <Link2 className="size-4" aria-hidden />
+                <span className="hidden md:inline">Hubungkan Sheet</span>
+              </Button>
+            )}
+
             {/* Sinkron manual */}
             <Button
               variant="outline"
@@ -151,6 +171,9 @@ export default function Home() {
           <p>Tilawah Tracker • One Day One Juz • Barokallahu fiikum</p>
         </div>
       </footer>
+
+      {/* ---------- Dialog setup Google Sheet (global) ---------- */}
+      <SheetSetupDialog />
     </div>
   )
 }

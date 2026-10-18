@@ -15,7 +15,9 @@ import {
   type DayResponse,
   type MatrixColumn,
   type ParticipantStats,
+  type PushResult,
   type SheetRow,
+  type SheetSettings,
   type StatusTilawah,
   parseSheetCsv,
   toDayInfo,
@@ -347,10 +349,164 @@ export async function buildDayResponse(params: {
 }
 
 // ------------------------------------------------------------
-// Simpan update status dari app
+// Simpan update status dari app + tulis ke Google Sheet
 // ------------------------------------------------------------
 
-export async function saveProgress(updates: { harike: number; nama: string; status: StatusTilawah }[]) {
+const WEBAPP_URL_KEY = 'sheetWebAppUrl'
+
+/** Baca pengaturan koneksi Google Sheet (Web App URL + jumlah baris belum terkirim) */
+export async function getSheetSettings(): Promise<SheetSettings> {
+  const [meta, pendingCount] = await Promise.all([
+    db.syncMeta.findUnique({ where: { key: WEBAPP_URL_KEY } }),
+    db.localUpdate.count({ where: { sheetSynced: false } }),
+  ])
+  return {
+    connected: Boolean(meta?.value),
+    url: meta?.value ?? null,
+    pendingCount,
+  }
+}
+
+/** Validasi + simpan Web App URL Apps Script (uji koneksi dengan GET) */
+export async function saveSheetUrl(rawUrl: string): Promise<void> {
+  const url = rawUrl.trim()
+  if (!/^https:\/\/script\.google\.com\/.+\/exec(\?.*)?$/.test(url)) {
+    throw new Error(
+      'URL tidak valid. Tempelkan Web App URL Apps Script yang berakhiran /exec',
+    )
+  }
+
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), 15_000)
+  try {
+    const res = await fetch(url, { signal: ctrl.signal, redirect: 'follow', cache: 'no-store' })
+    const text = await res.text()
+    let body: { ok?: boolean; message?: string } = {}
+    try {
+      body = JSON.parse(text) as { ok?: boolean }
+    } catch {
+      throw new Error(
+        'Web App tidak mengembalikan JSON. Pastikan deployment: Execute as "Me" dan akses "Anyone".',
+      )
+    }
+    if (!res.ok || !body.ok) {
+      throw new Error('Web App merespons tidak sesuai. Pastikan kode Apps Script sesuai contoh.')
+    }
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new Error('Timeout menghubungi Web App (15 detik). Periksa URL dan deployment.')
+    }
+    if (err instanceof Error && /fetch failed|ENOTFOUND|getaddrinfo/i.test(err.message)) {
+      throw new Error('Tidak dapat menghubungi script.google.com. Periksa URL Web App.')
+    }
+    throw err
+  } finally {
+    clearTimeout(timer)
+  }
+
+  await db.syncMeta.upsert({
+    where: { key: WEBAPP_URL_KEY },
+    create: { key: WEBAPP_URL_KEY, value: url },
+    update: { value: url },
+  })
+}
+
+/** Hapus koneksi ke Google Sheet */
+export async function clearSheetUrl(): Promise<void> {
+  await db.syncMeta.deleteMany({ where: { key: WEBAPP_URL_KEY } })
+}
+
+interface AppsScriptResponse {
+  ok?: boolean
+  error?: string
+  results?: { harike: number; nama: string; ok: boolean }[]
+}
+
+/**
+ * Kirim semua LocalUpdate yang belum tersinkron (sheetSynced=false) ke
+ * Google Sheet melalui Apps Script Web App.
+ */
+export async function pushPendingToSheet(): Promise<PushResult> {
+  const meta = await db.syncMeta.findUnique({ where: { key: WEBAPP_URL_KEY } })
+  const url = meta?.value
+  if (!url) {
+    return { ok: false, skipped: true, error: 'Google Sheet belum terhubung (Web App URL belum diisi)' }
+  }
+
+  const pending = await db.localUpdate.findMany({ where: { sheetSynced: false } })
+  if (pending.length === 0) return { ok: true, pushed: 0 }
+
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), 20_000)
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        updates: pending.map((p) => ({ harike: p.harike, nama: p.nama, status: p.status })),
+      }),
+      signal: ctrl.signal,
+      redirect: 'follow',
+    })
+    const text = await res.text()
+    let body: AppsScriptResponse = {}
+    try {
+      body = JSON.parse(text) as AppsScriptResponse
+    } catch {
+      return { ok: false, error: `Web App merespons ${res.status} (bukan JSON). Periksa deployment.` }
+    }
+    if (!res.ok || !body.ok) {
+      return { ok: false, error: body.error ?? `Web App merespons ${res.status}` }
+    }
+
+    // Tandai baris yang berhasil ditulis di sheet
+    const hasResults = Array.isArray(body.results) && body.results.length > 0
+    const okSet = new Set<string>()
+    if (hasResults) {
+      for (const r of body.results!) if (r.ok) okSet.add(`${r.harike}::${r.nama}`)
+    }
+    const rowsToMark = hasResults
+      ? pending.filter((p) => okSet.has(`${p.harike}::${p.nama}`))
+      : pending
+
+    if (rowsToMark.length > 0) {
+      await db.$transaction(
+        rowsToMark.map((p) =>
+          db.localUpdate.update({
+            where: { harike_nama: { harike: p.harike, nama: p.nama } },
+            data: { sheetSynced: true },
+          }),
+        ),
+      )
+    }
+
+    const allOk = rowsToMark.length === pending.length
+    return {
+      ok: allOk,
+      pushed: rowsToMark.length,
+      error: allOk ? undefined : body.error || 'Sebagian baris tidak ditemukan di sheet',
+    }
+  } catch (err) {
+    const msg =
+      err instanceof Error
+        ? err.name === 'AbortError'
+          ? 'Timeout menghubungi Google Sheet (20 detik)'
+          : err.message
+        : 'Gagal terhubung ke Google Sheet'
+    return { ok: false, error: msg }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+export interface SaveProgressResult extends DayResponse {
+  push: PushResult
+}
+
+/** Simpan update status dari app, lalu langsung tulis ke Google Sheet */
+export async function saveProgress(
+  updates: { harike: number; nama: string; status: StatusTilawah }[],
+): Promise<SaveProgressResult> {
   const valid = updates.filter(
     (u) =>
       Number.isFinite(u.harike) &&
@@ -366,13 +522,16 @@ export async function saveProgress(updates: { harike: number; nama: string; stat
     valid.map((u) =>
       db.localUpdate.upsert({
         where: { harike_nama: { harike: u.harike, nama: u.nama } },
-        create: { harike: u.harike, nama: u.nama, status: u.status },
-        update: { status: u.status },
+        create: { harike: u.harike, nama: u.nama, status: u.status, sheetSynced: false },
+        update: { status: u.status, sheetSynced: false },
       }),
     ),
   )
 
+  // Tulis ke Google Sheet via Apps Script Web App (bila sudah terhubung)
+  const push = await pushPendingToSheet()
+
   const harike = valid[0].harike
   const resp = await buildDayResponse({ harike })
-  return resp
+  return { ...resp, push }
 }

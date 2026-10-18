@@ -5,6 +5,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
   CalendarDays,
+  CheckCircle2,
   ChevronDown,
   ClipboardList,
   Info,
@@ -36,12 +37,14 @@ import { cn } from '@/lib/utils'
 import {
   type DayEntry,
   type DayResponse,
+  type PushResult,
   type StatusTilawah,
   formatTanggal,
   formatWaktu,
   todayJakarta,
 } from '@/lib/tilawah'
 import { StatusSegmented } from '@/components/tilawah/status-controls'
+import { SheetConnectionBanner, openSheetSetup } from '@/components/tilawah/sheet-setup-dialog'
 
 const pad = (n: number) => String(n).padStart(2, '0')
 const toISO = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
@@ -69,6 +72,7 @@ export function UpdateView({ onGoDashboard, refreshKey }: UpdateViewProps) {
   const [calOpen, setCalOpen] = useState(false)
   const [congratsOpen, setCongratsOpen] = useState(false)
   const [savedCount, setSavedCount] = useState(0)
+  const [pushResult, setPushResult] = useState<PushResult | null>(null)
 
   const { data, isLoading, isError, error } = useQuery({
     queryKey: ['day', selectedDate, selectedHarike, refreshKey],
@@ -109,16 +113,34 @@ export function UpdateView({ onGoDashboard, refreshKey }: UpdateViewProps) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ updates }),
       })
-      const body = (await res.json()) as { ok?: boolean; error?: string }
+      const body = (await res.json()) as { ok?: boolean; error?: string; push?: PushResult }
       if (!res.ok || !body.ok) throw new Error(body.error ?? 'Gagal menyimpan')
       return body
     },
-    onSuccess: (_body, updates) => {
+    onSuccess: (body, updates) => {
       setSavedCount(updates.length)
+      setPushResult(body.push ?? null)
       setEdits({})
       queryClient.invalidateQueries({ queryKey: ['day'] })
       queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      queryClient.invalidateQueries({ queryKey: ['sheet-settings'] })
       setCongratsOpen(true)
+    },
+  })
+
+  // Kirim ulang perubahan yang gagal terkirim ke Google Sheet
+  const pushMutation = useMutation({
+    mutationFn: async () => {
+      const res = await fetch('/api/push', { method: 'POST' })
+      const body = (await res.json()) as { ok?: boolean; push?: PushResult; error?: string }
+      if (!res.ok || !body.ok) throw new Error(body.error ?? 'Gagal mengirim')
+      return body
+    },
+    onSuccess: (body) => {
+      setPushResult(body.push ?? { ok: true, pushed: 0 })
+      queryClient.invalidateQueries({ queryKey: ['sheet-settings'] })
+      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      queryClient.invalidateQueries({ queryKey: ['day'] })
     },
   })
 
@@ -144,6 +166,9 @@ export function UpdateView({ onGoDashboard, refreshKey }: UpdateViewProps) {
 
   return (
     <div className="space-y-6">
+      {/* ---------- Status koneksi Google Sheet ---------- */}
+      <SheetConnectionBanner />
+
       {/* ---------- Pilih jadwal ---------- */}
       <Card className="border-stone-200/80 shadow-sm">
         <CardHeader className="pb-4">
@@ -401,6 +426,55 @@ export function UpdateView({ onGoDashboard, refreshKey }: UpdateViewProps) {
               Semoga Allah memudahkan dan memberkahi khataman Al-Qur&apos;an kita semua.
             </DialogDescription>
           </DialogHeader>
+
+          {/* ---------- Status penulisan ke Google Sheet ---------- */}
+          {pushResult?.ok && (pushResult.pushed ?? 0) > 0 && (
+            <p className="flex items-center justify-center gap-1.5 rounded-lg bg-emerald-50 px-3 py-2 text-xs font-medium text-emerald-700">
+              <CheckCircle2 className="size-4" aria-hidden />
+              {pushResult.pushed} status berhasil ditulis ke Google Sheet
+            </p>
+          )}
+          {pushResult && !pushResult.ok && (
+            <div
+              className={cn(
+                'rounded-lg border p-3 text-xs leading-relaxed',
+                pushResult.skipped
+                  ? 'border-teal-200 bg-teal-50 text-teal-900'
+                  : 'border-amber-200 bg-amber-50 text-amber-900',
+              )}
+            >
+              {pushResult.skipped ? (
+                <>
+                  <p>
+                    Data tersimpan di aplikasi. Agar status <b>ikut ditulis ke Google Sheet</b>, hubungkan aplikasi
+                    dengan jembatan Apps Script terlebih dulu.
+                  </p>
+                  <Button
+                    onClick={() => {
+                      setCongratsOpen(false)
+                      openSheetSetup()
+                    }}
+                    className="mt-2 min-h-[40px] w-full bg-teal-600 font-semibold text-white hover:bg-teal-700"
+                  >
+                    Hubungkan Google Sheet
+                  </Button>
+                </>
+              ) : (
+                <>
+                  <p>
+                    Tersimpan di aplikasi, namun <b>gagal ditulis ke Google Sheet</b>: {pushResult.error}
+                  </p>
+                  <Button
+                    onClick={() => pushMutation.mutate()}
+                    disabled={pushMutation.isPending}
+                    className="mt-2 min-h-[40px] w-full bg-amber-600 font-semibold text-white hover:bg-amber-700"
+                  >
+                    {pushMutation.isPending ? 'Mengirim ulang…' : 'Kirim Ulang ke Sheet'}
+                  </Button>
+                </>
+              )}
+            </div>
+          )}
           <DialogFooter className="flex-col gap-2 sm:flex-col sm:justify-center">
             <Button
               onClick={() => {

@@ -92,6 +92,99 @@ export interface DayResponse {
   semuaHari: DayListItem[]
 }
 
+/** Hasil upaya menulis status ke Google Sheet (via Apps Script Web App) */
+export interface PushResult {
+  ok: boolean
+  skipped?: boolean // Web App URL belum dikonfigurasi
+  pushed?: number // jumlah baris yang berhasil ditulis
+  error?: string
+}
+
+/** Pengaturan koneksi ke Google Sheet */
+export interface SheetSettings {
+  connected: boolean
+  url: string | null
+  pendingCount: number
+}
+
+// ------------------------------------------------------------
+// Kode Google Apps Script (ditempel pemilik sheet satu kali,
+// dipakai aplikasi untuk MENULIS status ke Google Sheet)
+// ------------------------------------------------------------
+
+export const APPS_SCRIPT_CODE = `/**
+ * Jembatan Tilawah Tracker -> Google Sheet
+ *
+ * Cara pakai:
+ * 1. Buka Google Sheet > menu Ekstensi > Apps Script
+ * 2. Hapus isi editor, tempel seluruh kode ini (ganti nama file jadi Code.gs)
+ * 3. Klik Deploy > Deployment baru > tipe: Aplikasi web
+ *      - Execute as  : Me (email Anda)
+ *      - Who has access: Anyone
+ * 4. Klik Deploy > izinkan akses (Authorize) > salin Web app URL (akhiran /exec)
+ * 5. Tempel URL tersebut di aplikasi Tilawah Tracker (dialog Hubungkan Google Sheet)
+ */
+
+function doPost(e) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    var body = JSON.parse(e.postData.contents);
+    var updates = body.updates || [];
+    if (!updates.length) return out({ ok: false, error: 'Tidak ada update' });
+
+    var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheets()[0];
+    var data = sheet.getDataRange().getValues();
+    // Kolom sheet: A=harike, B=haritgl, C=target, D=nama, E=status, F=timestamp
+    var COL_HARIKE = 0, COL_NAMA = 3, COL_STATUS = 4, COL_TS = 5;
+    var now = Utilities.formatDate(new Date(), 'Asia/Jakarta', 'M/d/yyyy');
+
+    var results = [];
+    for (var i = 0; i < updates.length; i++) {
+      var u = updates[i];
+      var harike = parseInt(u.harike, 10);
+      var nama = String(u.nama || '').trim();
+      var status = String(u.status || 'Belum');
+      var found = false;
+      for (var r = 1; r < data.length; r++) {
+        if (parseInt(data[r][COL_HARIKE], 10) === harike &&
+            String(data[r][COL_NAMA]).trim() === nama) {
+          sheet.getRange(r + 1, COL_STATUS + 1).setValue(status);
+          sheet.getRange(r + 1, COL_TS + 1).setValue(now);
+          found = true;
+          break;
+        }
+      }
+      results.push({ harike: harike, nama: nama, status: status, ok: found });
+    }
+
+    SpreadsheetApp.flush();
+    var gagal = [];
+    for (var j = 0; j < results.length; j++) if (!results[j].ok) gagal.push(results[j].nama);
+
+    return out({
+      ok: true,
+      updated: results.length - gagal.length,
+      results: results,
+      error: gagal.length ? ('Baris tidak ditemukan di sheet: ' + gagal.join(', ')) : ''
+    });
+  } catch (err) {
+    return out({ ok: false, error: String(err) });
+  } finally {
+    try { lock.releaseLock(); } catch (ignored) {}
+  }
+}
+
+function doGet(e) {
+  return out({ ok: true, message: 'Tilawah Tracker siap menerima update status' });
+}
+
+function out(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+`
+
 // ------------------------------------------------------------
 // Parsing tanggal dari sheet (format campur aduk)
 //  - "30-Sep-2026"  → 2026-09-30

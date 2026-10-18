@@ -30,11 +30,12 @@ model TilawahEntry {
 
 // Update status yang dilakukan lewat aplikasi web (overlay di atas sheet)
 model LocalUpdate {
-  id        Int      @id @default(autoincrement())
-  harike    Int
-  nama      String
-  status    String // Belum | On Progress | Selesai
-  updatedAt DateTime @updatedAt
+  id          Int      @id @default(autoincrement())
+  harike      Int
+  nama        String
+  status      String // Belum | On Progress | Selesai
+  sheetSynced Boolean  @default(false) // apakah sudah berhasil ditulis ke Google Sheet
+  updatedAt   DateTime @updatedAt
 
   @@unique([harike, nama])
   @@index([harike])
