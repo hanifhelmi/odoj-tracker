@@ -53,6 +53,9 @@ export function useSheetSettings() {
       if (!res.ok) throw new Error('Gagal memuat pengaturan Google Sheet')
       return res.json()
     },
+    // Status koneksi disegkan rutin — banner/button ikut memudar setelah
+    // auto-push latar belakang berhasil mengirim perubahan tertunda.
+    refetchInterval: 30_000,
   })
 }
 
@@ -159,7 +162,8 @@ export function SheetSetupDialog() {
           </DialogTitle>
           <DialogDescription className="text-left">
             Agar setiap update status <b>langsung menulis ke Google Sheet</b>, pasang jembatan Google Apps Script
-            berikut. Cukup sekali setup (±2 menit), admin sheet yang melakukan.
+            berikut. Cukup sekali setup (±2 menit), admin sheet yang melakukan — koneksi tersimpan permanen di server
+            dan otomatis aktif kembali bila server/sandbox restart.
           </DialogDescription>
         </DialogHeader>
 
@@ -311,7 +315,7 @@ export function SheetConnectionBanner() {
         <TriangleAlert className="size-5 shrink-0 text-amber-600" aria-hidden />
         <p className="flex-1 text-sm leading-relaxed text-amber-900">
           <span className="font-semibold">Google Sheet belum terhubung.</span> Perubahan status hanya tersimpan di
-          aplikasi ini. Hubungkan aplikasi ke Google Sheet agar setiap update langsung menulis ke Sheet.
+          aplikasi ini. Hubungkan <b>sekali saja</b> — koneksi tersimpan permanen di server, tidak perlu diulang.
         </p>
         <Button
           onClick={openSheetSetup}
@@ -330,14 +334,14 @@ export function SheetConnectionBanner() {
         <LoaderCircle className="size-5 shrink-0 text-teal-600" aria-hidden />
         <p className="flex-1 text-sm text-teal-900">
           <span className="font-semibold">{settings.data.pendingCount} perubahan</span> belum terkirim ke Google
-          Sheet.
+          Sheet — akan dikirim ulang <b>otomatis</b> (pemeriksaan tiap ±1 menit).
         </p>
         <Button
           onClick={() => pushMutation.mutate()}
           disabled={pushMutation.isPending}
           className="min-h-[44px] shrink-0 bg-teal-600 font-semibold text-white hover:bg-teal-700"
         >
-          {pushMutation.isPending ? 'Mengirim…' : 'Kirim Ulang'}
+          {pushMutation.isPending ? 'Mengirim…' : 'Kirim Sekarang'}
         </Button>
       </div>
     )

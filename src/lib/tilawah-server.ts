@@ -3,6 +3,9 @@
 // Sync Google Sheet → SQLite + agregasi data dashboard
 // ============================================================
 
+import fs from 'node:fs'
+import path from 'node:path'
+
 import { db } from '@/lib/db'
 import {
   SHEET_CSV_URL,
@@ -89,11 +92,16 @@ export async function syncFromSheet(force = false): Promise<SyncResult> {
   return { ok: true, rows: parsed.length, at: now }
 }
 
-/** Pastikan data tersedia (sync bila perlu) */
+/**
+ * Pastikan data tersedia (sync bila perlu) + jalankan pemulihan koneksi/update
+ * tertunda dari file tahan-reset, lalu aktifkan pengirim ulang otomatis.
+ */
 export async function ensureSynced(): Promise<SyncResult> {
+  startAutoPushLoop()
   const count = await db.tilawahEntry.count()
-  if (count === 0) return syncFromSheet(true)
-  return syncFromSheet(false)
+  const result = count === 0 ? await syncFromSheet(true) : await syncFromSheet(false)
+  await restorePendingFromBridge()
+  return result
 }
 
 // ------------------------------------------------------------
@@ -392,30 +400,176 @@ export async function buildDayResponse(params: {
 
 const WEBAPP_URL_KEY = 'sheetWebAppUrl'
 
-/** Baca pengaturan koneksi Google Sheet (Web App URL + jumlah baris belum terkirim) */
-export async function getSheetSettings(): Promise<SheetSettings> {
-  const [meta, pendingCount] = await Promise.all([
-    db.syncMeta.findUnique({ where: { key: WEBAPP_URL_KEY } }),
-    db.localUpdate.count({ where: { sheetSynced: false } }),
-  ])
-  return {
-    connected: Boolean(meta?.value),
-    url: meta?.value ?? null,
-    pendingCount,
+// ------------------------------------------------------------
+// Konfigurasi jembatan TAHAN RESET (di luar SQLite)
+//
+// SQLite di lingkungan sandbox dapat ter-reset saat server/sandbox
+// restart — jika Web App URL hanya disimpan di DB, koneksi hilang dan
+// aplikasi meminta "Hubungkan Sheet" lagi. Karena itu URL + update
+// tertunda dipantarkan juga ke file sheet-bridge.json, dan dibaca
+// kembali otomatis (self-heal) saat DB kehilangan datanya.
+// ------------------------------------------------------------
+
+const BRIDGE_FILE = path.join(process.cwd(), 'sheet-bridge.json')
+
+interface BridgePendingUpdate {
+  harike: number
+  nama: string
+  status: StatusTilawah
+  updatedAt: string
+}
+
+interface BridgeConfig {
+  version: 1
+  webAppUrl: string | null
+  savedAt: string | null
+  pendingUpdates: BridgePendingUpdate[]
+}
+
+function readBridgeConfig(): BridgeConfig {
+  const empty: BridgeConfig = { version: 1, webAppUrl: null, savedAt: null, pendingUpdates: [] }
+  try {
+    const raw = fs.readFileSync(BRIDGE_FILE, 'utf8')
+    const parsed = JSON.parse(raw) as Partial<BridgeConfig>
+    return {
+      version: 1,
+      webAppUrl:
+        typeof parsed.webAppUrl === 'string' && parsed.webAppUrl.trim().length > 0
+          ? parsed.webAppUrl.trim()
+          : null,
+      savedAt: typeof parsed.savedAt === 'string' ? parsed.savedAt : null,
+      pendingUpdates: Array.isArray(parsed.pendingUpdates)
+        ? parsed.pendingUpdates.filter(
+            (p) =>
+              p &&
+              Number.isFinite(p.harike) &&
+              typeof p.nama === 'string' &&
+              p.nama.length > 0 &&
+              (p.status === 'Belum' || p.status === 'On Progress' || p.status === 'Selesai'),
+          )
+        : [],
+    }
+  } catch {
+    return empty
   }
 }
 
-/** Validasi + simpan Web App URL Apps Script (uji koneksi dengan GET) */
-export async function saveSheetUrl(rawUrl: string): Promise<void> {
-  const url = rawUrl.trim()
-  if (!/^https:\/\/script\.google\.com\/.+\/exec(\?.*)?$/.test(url)) {
-    throw new Error(
-      'URL tidak valid. Tempelkan Web App URL Apps Script yang berakhiran /exec',
+function writeBridgeConfig(cfg: BridgeConfig): void {
+  try {
+    const tmp = `${BRIDGE_FILE}.tmp`
+    fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2), 'utf8')
+    fs.renameSync(tmp, BRIDGE_FILE)
+  } catch (err) {
+    console.error('[sheet-bridge] gagal menulis file konfigurasi:', err)
+  }
+}
+
+/** Simpan / hapus URL koneksi pada file tahan-reset */
+function persistUrlToBridge(url: string | null): void {
+  const cfg = readBridgeConfig()
+  writeBridgeConfig({
+    ...cfg,
+    webAppUrl: url,
+    savedAt: url ? new Date().toISOString() : cfg.savedAt,
+  })
+}
+
+/** Pantarkan daftar update tertunda (DB → file) sebagai cadangan bila DB ter-reset */
+async function mirrorPendingToBridge(): Promise<void> {
+  try {
+    const pending = await db.localUpdate.findMany({
+      where: { sheetSynced: false },
+      orderBy: { id: 'asc' },
+    })
+    const mirrored: BridgePendingUpdate[] = pending.map((p) => ({
+      harike: p.harike,
+      nama: p.nama,
+      status: p.status as StatusTilawah,
+      updatedAt: p.updatedAt.toISOString(),
+    }))
+    const cfg = readBridgeConfig()
+    if (JSON.stringify(cfg.pendingUpdates) === JSON.stringify(mirrored)) return
+    writeBridgeConfig({ ...cfg, pendingUpdates: mirrored })
+  } catch (err) {
+    console.error('[sheet-bridge] gagal memantarkan update tertunda:', err)
+  }
+}
+
+let restorePromise: Promise<void> | null = null
+
+/** Pulihkan update tertunda dari file bila DB kosong (setelah reset/restart) */
+export function restorePendingFromBridge(): Promise<void> {
+  restorePromise ??= (async () => {
+    try {
+      const pending = readBridgeConfig().pendingUpdates
+      if (pending.length === 0) return
+      const count = await db.localUpdate.count()
+      if (count > 0) return // DB masih utuh — file hanya cadangan
+      const entries = await db.tilawahEntry.findMany({ select: { harike: true, nama: true } })
+      const existing = new Set(entries.map((e) => `${e.harike}::${e.nama}`))
+      const rows = pending.filter((p) => existing.has(`${p.harike}::${p.nama}`))
+      if (rows.length === 0) return
+      await db.localUpdate.createMany({
+        data: rows.map((p) => ({
+          harike: p.harike,
+          nama: p.nama,
+          status: p.status,
+          sheetSynced: false,
+        })),
+      })
+      console.log(
+        `[sheet-bridge] ${rows.length} update tertunda dipulihkan dari sheet-bridge.json setelah reset DB`,
+      )
+      void autoPushOnce('restore')
+    } catch (err) {
+      console.error('[sheet-bridge] gagal memulihkan update tertunda:', err)
+    }
+  })()
+  return restorePromise
+}
+
+/**
+ * Ambil Web App URL koneksi. Urutan sumber: DB → sheet-bridge.json → env.
+ * Bila DB kehilangan datanya, URL dipulihkan otomatis (self-heal).
+ */
+async function getBridgeUrl(): Promise<string | null> {
+  const meta = await db.syncMeta.findUnique({ where: { key: WEBAPP_URL_KEY } })
+  if (meta?.value) return meta.value
+
+  const fromFile = readBridgeConfig().webAppUrl
+  const fromEnv = process.env.SHEET_WEBAPP_URL?.trim() || null
+  const recovered = fromFile ?? fromEnv
+  if (recovered) {
+    await db.syncMeta.upsert({
+      where: { key: WEBAPP_URL_KEY },
+      create: { key: WEBAPP_URL_KEY, value: recovered },
+      update: { value: recovered },
+    })
+    console.log(
+      '[sheet-bridge] koneksi Google Sheet dipulihkan otomatis dari',
+      fromFile ? 'sheet-bridge.json' : 'SHEET_WEBAPP_URL',
     )
   }
+  return recovered
+}
 
+/** Baca pengaturan koneksi Google Sheet (Web App URL + jumlah baris belum terkirim) */
+export async function getSheetSettings(): Promise<SheetSettings> {
+  startAutoPushLoop()
+  await restorePendingFromBridge()
+  const [url, pendingCount] = await Promise.all([
+    getBridgeUrl(),
+    db.localUpdate.count({ where: { sheetSynced: false } }),
+  ])
+  // Ada yang tertunda? Kirim ulang otomatis di latar belakang (dengan penjaga jeda)
+  void autoPushOnce('settings')
+  return { connected: Boolean(url), url, pendingCount }
+}
+
+/** Uji koneksi ke Web App Apps Script (GET harus mengembalikan JSON ok) */
+async function testWebApp(url: string): Promise<void> {
   const ctrl = new AbortController()
-  const timer = setTimeout(() => ctrl.abort(), 15_000)
+  const timer = setTimeout(() => ctrl.abort(), 20_000)
   try {
     const res = await fetch(url, { signal: ctrl.signal, redirect: 'follow', cache: 'no-store' })
     const text = await res.text()
@@ -432,7 +586,7 @@ export async function saveSheetUrl(rawUrl: string): Promise<void> {
     }
   } catch (err) {
     if (err instanceof Error && err.name === 'AbortError') {
-      throw new Error('Timeout menghubungi Web App (15 detik). Periksa URL dan deployment.')
+      throw new Error('Timeout menghubungi Web App (20 detik). Periksa URL dan deployment.')
     }
     if (err instanceof Error && /fetch failed|ENOTFOUND|getaddrinfo/i.test(err.message)) {
       throw new Error('Tidak dapat menghubungi script.google.com. Periksa URL Web App.')
@@ -441,17 +595,43 @@ export async function saveSheetUrl(rawUrl: string): Promise<void> {
   } finally {
     clearTimeout(timer)
   }
+}
+
+/** Validasi + simpan Web App URL Apps Script (uji koneksi dengan GET, 2 kali percobaan) */
+export async function saveSheetUrl(rawUrl: string): Promise<void> {
+  const url = rawUrl.trim()
+  if (!/^https:\/\/script\.google\.com\/.+\/exec(\?.*)?$/.test(url)) {
+    throw new Error('URL tidak valid. Tempelkan Web App URL Apps Script yang berakhiran /exec')
+  }
+
+  // Google kadang lambat/gagal sesaat — coba 2 kali sebelum menyatakan gagal
+  let lastError: unknown = null
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      await testWebApp(url)
+      lastError = null
+      break
+    } catch (err) {
+      lastError = err
+      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 1500))
+    }
+  }
+  if (lastError) throw lastError
 
   await db.syncMeta.upsert({
     where: { key: WEBAPP_URL_KEY },
     create: { key: WEBAPP_URL_KEY, value: url },
     update: { value: url },
   })
+  // Simpan juga ke file tahan-reset agar koneksi tidak hilang saat DB/server ter-reset
+  persistUrlToBridge(url)
+  console.log('[sheet-bridge] koneksi Google Sheet tersimpan (DB + sheet-bridge.json)')
 }
 
-/** Hapus koneksi ke Google Sheet */
+/** Hapus koneksi ke Google Sheet (DB + file tahan-reset) */
 export async function clearSheetUrl(): Promise<void> {
   await db.syncMeta.deleteMany({ where: { key: WEBAPP_URL_KEY } })
+  persistUrlToBridge(null)
 }
 
 interface AppsScriptResponse {
@@ -465,8 +645,7 @@ interface AppsScriptResponse {
  * Google Sheet melalui Apps Script Web App.
  */
 export async function pushPendingToSheet(): Promise<PushResult> {
-  const meta = await db.syncMeta.findUnique({ where: { key: WEBAPP_URL_KEY } })
-  const url = meta?.value
+  const url = await getBridgeUrl()
   if (!url) {
     return { ok: false, skipped: true, error: 'Google Sheet belum terhubung (Web App URL belum diisi)' }
   }
@@ -518,6 +697,9 @@ export async function pushPendingToSheet(): Promise<PushResult> {
       )
     }
 
+    // Perbarui cermin cadangan (baris yang masih tertunda setelah pengiriman)
+    await mirrorPendingToBridge()
+
     const allOk = rowsToMark.length === pending.length
     return {
       ok: allOk,
@@ -535,6 +717,67 @@ export async function pushPendingToSheet(): Promise<PushResult> {
   } finally {
     clearTimeout(timer)
   }
+}
+
+// ------------------------------------------------------------
+// Auto-push latar belakang — kirim ulang update tertunda secara
+// otomatis sehingga data selalu mengalir ke Google Sheet tanpa
+// perlu tekanan manual ("Kirim Ulang").
+// ------------------------------------------------------------
+
+const AUTO_PUSH_INTERVAL_MS = 60_000 // pemeriksaan tiap 1 menit
+const AUTO_PUSH_MIN_GAP_MS = 45_000 // jeda minimal antar percobaan
+
+interface AutoPushGlobal {
+  __tilawahAutoPushTimer?: ReturnType<typeof setInterval>
+  __tilawahAutoPushLast?: number
+  __tilawahAutoPushBusy?: boolean
+}
+
+// globalThis agar aman dari double-instantiasi module (HMR/dev)
+const autoPushGlobal = globalThis as unknown as AutoPushGlobal
+
+/** Satu percobaan kirim-ulang otomatis (dengan penjaga agar tidak spam) */
+export async function autoPushOnce(trigger: string): Promise<PushResult | null> {
+  if (autoPushGlobal.__tilawahAutoPushBusy) return null
+  const now = Date.now()
+  if (
+    autoPushGlobal.__tilawahAutoPushLast &&
+    now - autoPushGlobal.__tilawahAutoPushLast < AUTO_PUSH_MIN_GAP_MS
+  ) {
+    return null
+  }
+  try {
+    autoPushGlobal.__tilawahAutoPushBusy = true
+    const url = await getBridgeUrl()
+    if (!url) return null
+    const pending = await db.localUpdate.count({ where: { sheetSynced: false } })
+    if (pending === 0) return null
+
+    autoPushGlobal.__tilawahAutoPushLast = now
+    console.log(`[auto-push] mengirim ${pending} perubahan tertunda ke Google Sheet (${trigger})…`)
+    const result = await pushPendingToSheet()
+    if (result.ok) {
+      console.log(`[auto-push] berhasil: ${result.pushed ?? 0} perubahan tertulis di Google Sheet`)
+    } else {
+      console.warn('[auto-push] gagal:', result.error)
+    }
+    return result
+  } catch (err) {
+    console.error('[auto-push] error:', err)
+    return null
+  } finally {
+    autoPushGlobal.__tilawahAutoPushBusy = false
+  }
+}
+
+/** Jalankan loop pemeriksaan otomatis (sekali per proses, aman dipanggil berulang) */
+export function startAutoPushLoop(): void {
+  if (autoPushGlobal.__tilawahAutoPushTimer) return
+  autoPushGlobal.__tilawahAutoPushTimer = setInterval(() => {
+    void autoPushOnce('interval')
+  }, AUTO_PUSH_INTERVAL_MS)
+  autoPushGlobal.__tilawahAutoPushTimer.unref?.()
 }
 
 export interface SaveProgressResult extends DayResponse {
@@ -565,6 +808,9 @@ export async function saveProgress(
       }),
     ),
   )
+
+  // Pantarkan update tertunda ke file tahan-reset SEBELUM mencoba push
+  await mirrorPendingToBridge()
 
   // Tulis ke Google Sheet via Apps Script Web App (bila sudah terhubung)
   const push = await pushPendingToSheet()

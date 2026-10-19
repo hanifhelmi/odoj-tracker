@@ -53,3 +53,25 @@ Stage Summary:
 - Posisi program di seluruh dashboard kini selalu = baris sheet dengan haritgl == hari ini (Asia/Jakarta), bukan lagi hari-unfinished terawal; caption hero dan kartu statistik konsisten dengan logika tersebut.
 - Aman untuk tanggal tanpa jadwal (fallback tanggal terdekat) dan sheet tanpa kolom tanggal (fallback hari-unfinished terawal).
 - Tidak ada perubahan skema DB / API contract; perubahan murni logika agregasi + tampilan.
+
+---
+Task ID: Fix 3
+Agent: Z.ai Code (main agent)
+Task: Perbaikan — "sering koneksi aplikasi ke Google Sheet terputus, diminta Hubungkan Sheet kembali". Agar koneksi & data terjaga terus (always-connected).
+
+Work Log:
+- Diagnosis akar masalah: SQLite (db/custom.db) ter-reset saat sandbox/dev server restart (dibuktikan: SyncMeta kehilangan key sheetWebAppUrl + lastSyncAt, TilawahEntry kosong lalu tersinkron ulang pagi ini). URL koneksi sebelumnya HANYA disimpan di SQLite → setiap restart, koneksi hilang → aplikasi meminta "Hubungkan Sheet" ulang. LokalUpdate tertunda pun berisiko hilang.
+- Backend (src/lib/tilawah-server.ts) — arsitektur tahan-reset:
+  1) File konfigurasi durable sheet-bridge.json (root proyek) menyimpan { webAppUrl, savedAt, pendingUpdates } dengan penulisan atomik (tmp+rename).
+  2) getBridgeUrl(): sumber berlapis DB → sheet-bridge.json → env SHEET_WEBAPP_URL; bila DB kehilangan URL, otomatis dipulihkan ke DB (self-heal) + log "[sheet-bridge] koneksi dipulihkan otomatis".
+  3) saveSheetUrl: uji koneksi kini 2 percobaan (timeout 20s, jeda 1,5s) tahan gangguan sesaat Google; simpan ke DB + file. clearSheetUrl: hapus dari DB + file (pending tetap dipertahankan).
+  4) Mirror pending: mirrorPendingToBridge() menyalin LocalUpdate sheetSynced=false ke file (dipanggil setelah saveProgress & setelah push); restorePendingFromBridge() memulihkan update tertunda dari file ke DB bila DB kosong (hanya baris yang masih ada di sheet), lalu memicu auto-push.
+  5) Auto-push latar belakang: startAutoPushLoop() interval 60 detik (globalThis-guard, unref) + autoPushOnce(trigger) dengan penjaga busy & jeda min 45 detik; dipicu dari ensureSynced/getSheetSettings. Log jelas di dev.log ([auto-push] ...).
+  6) pushPendingToSheet kini baca URL via getBridgeUrl() (bukan DB mentah).
+- Frontend (sheet-setup-dialog.tsx): useSheetSettings refetchInterval 30 detik (banner/button ikut memudar setelah auto-push); copy dialog: "koneksi tersimpan permanen di server dan otomatis aktif kembali bila server/sandbox restart"; banner pending: "akan dikirim ulang otomatis (pemeriksaan tiap ±1 menit)" + tombol "Kirim Sekarang"; banner belum-terhubung: "Hubungkan sekali saja — koneksi tersimpan permanen".
+- E2E test (mock Apps Script bun :4444, skrip di .zscripts/): (1) auto-heal — URL hanya di file, DB kosong → GET /api/settings connected:true + DB terisi; (2) write-through — POST /api/progress → push.ok pushed:1, mock menerima update, sheetSynced=true, mirror file bersih; (3) restore — DB LocalUpdate dihapus + file berisi pending → restore memulihkan baris & auto-push mengirim ke mock, pending 0; (4) skenario persis user — URL dihapus dari DB + 1 pending → settings connected:true, auto-push (trigger settings) berhasil, pendingCount 1→0. Lint bersih. Cleanup penuh (URL test dihapus, LocalUpdate kosong, bridge file dihapus, mock dimatikan, force sync 180 baris; sheet kini 20 hari — 19 Okt = hari ke-20 target 10B).
+
+Stage Summary:
+- Koneksi Google Sheet kini TAHAN RESET: tersimpan di DB + sheet-bridge.json (+ env SHEET_WEBAPP_URL opsional); bila DB ter-reset, koneksi pulih otomatis tanpa "Hubungkan Sheet" ulang.
+- Update tertunda dipantarkan ke file dan dipulihkan otomatis; auto-push tiap ±1 menit memastikan semua perubahan akhirnya tertulis di Google Sheet tanpa aksi manual.
+- Satu-satunya setup yang tersisa bagi admin: deploy Apps Script + tempel URL sekali (dialog Hubungkan Sheet); setelah itu tidak pernah diminta lagi.
