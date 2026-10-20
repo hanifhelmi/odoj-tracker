@@ -4,6 +4,9 @@ import type { StatusTilawah } from '@/lib/tilawah'
 
 export const dynamic = 'force-dynamic'
 
+/** Batas eksekusi function di Vercel (detik) */
+export const maxDuration = 60
+
 interface SaveBody {
   updates?: { harike?: number; nama?: string; status?: string }[]
 }

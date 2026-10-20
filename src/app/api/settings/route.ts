@@ -3,6 +3,9 @@ import { clearSheetUrl, getSheetSettings, saveSheetUrl } from '@/lib/tilawah-ser
 
 export const dynamic = 'force-dynamic'
 
+/** Batas eksekusi function di Vercel (detik) */
+export const maxDuration = 60
+
 /** GET /api/settings — status koneksi Google Sheet + jumlah baris belum terkirim */
 export async function GET() {
   try {

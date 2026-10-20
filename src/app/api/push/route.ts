@@ -3,6 +3,9 @@ import { getSheetSettings, pushPendingToSheet } from '@/lib/tilawah-server'
 
 export const dynamic = 'force-dynamic'
 
+/** Batas eksekusi function di Vercel (detik) */
+export const maxDuration = 60
+
 /** POST /api/push — kirim ulang semua perubahan yang belum terkirim ke Google Sheet */
 export async function POST() {
   try {

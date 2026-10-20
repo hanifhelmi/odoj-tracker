@@ -3,6 +3,9 @@ import { buildDashboard, ensureSynced } from '@/lib/tilawah-server'
 
 export const dynamic = 'force-dynamic'
 
+/** Batas eksekusi function di Vercel (detik) */
+export const maxDuration = 60
+
 /** GET /api/dashboard?date=yyyy-MM-dd — data agregat dashboard */
 export async function GET(req: NextRequest) {
   try {

@@ -3,6 +3,9 @@ import { buildDayResponse, ensureSynced } from '@/lib/tilawah-server'
 
 export const dynamic = 'force-dynamic'
 
+/** Batas eksekusi function di Vercel (detik) */
+export const maxDuration = 60
+
 /**
  * GET /api/day?date=yyyy-MM-dd  atau  ?harike=6
  * Daftar peserta + status untuk satu hari program.

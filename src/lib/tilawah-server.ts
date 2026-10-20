@@ -1,12 +1,31 @@
 // ============================================================
 // Tilawah Tracker — Server-side logic
-// Sync Google Sheet → SQLite + agregasi data dashboard
+// Sync Google Sheet → SQLite/memori (via lapisan resilient) + agregasi
+//
+// Catatan deploy Vercel: di serverless database hanya OPSIONAL.
+// Sumber data permanen adalah Google Sheet (jadwal) + Apps Script
+// (penulisan status). Lihat src/lib/tilawah-store.ts.
 // ============================================================
 
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 
-import { db } from '@/lib/db'
+import {
+  countEntries,
+  countPendingLocals,
+  deleteMeta,
+  getMeta,
+  markLocalsSynced,
+  readAllEntries,
+  readAllLocals,
+  readPendingLocals,
+  replaceAllEntries,
+  restoreLocalsIfEmpty,
+  setMeta,
+  upsertLocals,
+  type StoreLocal,
+} from '@/lib/tilawah-store'
 import {
   SHEET_CSV_URL,
   SYNC_INTERVAL_MS,
@@ -44,12 +63,12 @@ export interface SyncResult {
  * Lokal update (LocalUpdate) tidak pernah tersentuh — status dari app selalu menang.
  */
 export async function syncFromSheet(force = false): Promise<SyncResult> {
-  const meta = await db.syncMeta.findUnique({ where: { key: 'lastSyncAt' } })
+  const lastSyncAt = await getMeta('lastSyncAt')
 
-  if (!force && meta) {
-    const age = Date.now() - new Date(meta.value).getTime()
+  if (!force && lastSyncAt) {
+    const age = Date.now() - new Date(lastSyncAt).getTime()
     if (age < SYNC_INTERVAL_MS) {
-      return { ok: true, skipped: true, rows: undefined, at: meta.value }
+      return { ok: true, skipped: true, rows: undefined, at: lastSyncAt }
     }
   }
 
@@ -70,24 +89,17 @@ export async function syncFromSheet(force = false): Promise<SyncResult> {
   }
 
   const now = new Date().toISOString()
-  await db.$transaction([
-    db.tilawahEntry.deleteMany(),
-    db.tilawahEntry.createMany({
-      data: parsed.map((r) => ({
-        harike: r.harike,
-        tanggal: r.tanggal,
-        target: r.target,
-        nama: r.nama,
-        sheetStatus: r.status,
-        sheetTimestamp: r.timestamp,
-      })),
-    }),
-    db.syncMeta.upsert({
-      where: { key: 'lastSyncAt' },
-      create: { key: 'lastSyncAt', value: now },
-      update: { value: now },
-    }),
-  ])
+  await replaceAllEntries(
+    parsed.map((r) => ({
+      harike: r.harike,
+      tanggal: r.tanggal,
+      target: r.target,
+      nama: r.nama,
+      sheetStatus: r.status,
+      sheetTimestamp: r.timestamp,
+    })),
+    now,
+  )
 
   return { ok: true, rows: parsed.length, at: now }
 }
@@ -98,7 +110,7 @@ export async function syncFromSheet(force = false): Promise<SyncResult> {
  */
 export async function ensureSynced(): Promise<SyncResult> {
   startAutoPushLoop()
-  const count = await db.tilawahEntry.count()
+  const count = await countEntries()
   const result = count === 0 ? await syncFromSheet(true) : await syncFromSheet(false)
   await restorePendingFromBridge()
   return result
@@ -119,12 +131,9 @@ interface EffectiveRow {
 }
 
 async function getEffectiveRows(): Promise<EffectiveRow[]> {
-  const [sheet, locals] = await Promise.all([
-    db.tilawahEntry.findMany({ orderBy: [{ harike: 'asc' }, { nama: 'asc' }] }),
-    db.localUpdate.findMany(),
-  ])
+  const [sheet, locals] = await Promise.all([readAllEntries(), readAllLocals()])
 
-  const localMap = new Map<string, (typeof locals)[number]>()
+  const localMap = new Map<string, StoreLocal>()
   for (const l of locals) localMap.set(`${l.harike}::${l.nama}`, l)
 
   return sheet.map((s) => {
@@ -152,7 +161,7 @@ function toDayEntry(r: EffectiveRow): DayEntry {
 
 export async function buildDashboard(hariIniISO: string | null): Promise<DashboardData> {
   const rows = await getEffectiveRows()
-  const lastSync = await db.syncMeta.findUnique({ where: { key: 'lastSyncAt' } })
+  const lastSync = await getMeta('lastSyncAt')
 
   // "Hari ini" (Asia/Jakarta) — pakai param ?date bila ada, bila tidak hitung sendiri
   const todayISO = hariIniISO?.trim() || todayJakarta()
@@ -305,7 +314,7 @@ export async function buildDashboard(hariIniISO: string | null): Promise<Dashboa
     peserta,
     matriks,
     aktivitasTerakhir,
-    lastSync: lastSync?.value ?? null,
+    lastSync: lastSync ?? null,
   }
 }
 
@@ -410,7 +419,12 @@ const WEBAPP_URL_KEY = 'sheetWebAppUrl'
 // kembali otomatis (self-heal) saat DB kehilangan datanya.
 // ------------------------------------------------------------
 
-const BRIDGE_FILE = path.join(process.cwd(), 'sheet-bridge.json')
+// Di Vercel filesystem bersifat read-only (kecuali /tmp) — file jembatan
+// disimpan ke /tmp agar tetap berfungsi; di lokal tetap di root proyek.
+const BRIDGE_FILE =
+  process.env.VERCEL === '1'
+    ? path.join(os.tmpdir(), 'sheet-bridge.json')
+    : path.join(process.cwd(), 'sheet-bridge.json')
 
 interface BridgePendingUpdate {
   harike: number
@@ -477,10 +491,7 @@ function persistUrlToBridge(url: string | null): void {
 /** Pantarkan daftar update tertunda (DB → file) sebagai cadangan bila DB ter-reset */
 async function mirrorPendingToBridge(): Promise<void> {
   try {
-    const pending = await db.localUpdate.findMany({
-      where: { sheetSynced: false },
-      orderBy: { id: 'asc' },
-    })
+    const pending = await readPendingLocals()
     const mirrored: BridgePendingUpdate[] = pending.map((p) => ({
       harike: p.harike,
       nama: p.nama,
@@ -503,22 +514,21 @@ export function restorePendingFromBridge(): Promise<void> {
     try {
       const pending = readBridgeConfig().pendingUpdates
       if (pending.length === 0) return
-      const count = await db.localUpdate.count()
-      if (count > 0) return // DB masih utuh — file hanya cadangan
-      const entries = await db.tilawahEntry.findMany({ select: { harike: true, nama: true } })
+      const entries = await readAllEntries()
       const existing = new Set(entries.map((e) => `${e.harike}::${e.nama}`))
       const rows = pending.filter((p) => existing.has(`${p.harike}::${p.nama}`))
       if (rows.length === 0) return
-      await db.localUpdate.createMany({
-        data: rows.map((p) => ({
+      const restored = await restoreLocalsIfEmpty(
+        rows.map((p) => ({
           harike: p.harike,
           nama: p.nama,
           status: p.status,
-          sheetSynced: false,
+          updatedAt: p.updatedAt,
         })),
-      })
+      )
+      if (!restored) return // data lokal masih utuh — file hanya cadangan
       console.log(
-        `[sheet-bridge] ${rows.length} update tertunda dipulihkan dari sheet-bridge.json setelah reset DB`,
+        `[sheet-bridge] ${rows.length} update tertunda dipulihkan dari sheet-bridge.json setelah reset`,
       )
       void autoPushOnce('restore')
     } catch (err) {
@@ -533,18 +543,14 @@ export function restorePendingFromBridge(): Promise<void> {
  * Bila DB kehilangan datanya, URL dipulihkan otomatis (self-heal).
  */
 async function getBridgeUrl(): Promise<string | null> {
-  const meta = await db.syncMeta.findUnique({ where: { key: WEBAPP_URL_KEY } })
-  if (meta?.value) return meta.value
+  const saved = await getMeta(WEBAPP_URL_KEY)
+  if (saved) return saved
 
   const fromFile = readBridgeConfig().webAppUrl
   const fromEnv = process.env.SHEET_WEBAPP_URL?.trim() || null
   const recovered = fromFile ?? fromEnv
   if (recovered) {
-    await db.syncMeta.upsert({
-      where: { key: WEBAPP_URL_KEY },
-      create: { key: WEBAPP_URL_KEY, value: recovered },
-      update: { value: recovered },
-    })
+    await setMeta(WEBAPP_URL_KEY, recovered)
     console.log(
       '[sheet-bridge] koneksi Google Sheet dipulihkan otomatis dari',
       fromFile ? 'sheet-bridge.json' : 'SHEET_WEBAPP_URL',
@@ -557,10 +563,7 @@ async function getBridgeUrl(): Promise<string | null> {
 export async function getSheetSettings(): Promise<SheetSettings> {
   startAutoPushLoop()
   await restorePendingFromBridge()
-  const [url, pendingCount] = await Promise.all([
-    getBridgeUrl(),
-    db.localUpdate.count({ where: { sheetSynced: false } }),
-  ])
+  const [url, pendingCount] = await Promise.all([getBridgeUrl(), countPendingLocals()])
   // Ada yang tertunda? Kirim ulang otomatis di latar belakang (dengan penjaga jeda)
   void autoPushOnce('settings')
   return { connected: Boolean(url), url, pendingCount }
@@ -618,11 +621,7 @@ export async function saveSheetUrl(rawUrl: string): Promise<void> {
   }
   if (lastError) throw lastError
 
-  await db.syncMeta.upsert({
-    where: { key: WEBAPP_URL_KEY },
-    create: { key: WEBAPP_URL_KEY, value: url },
-    update: { value: url },
-  })
+  await setMeta(WEBAPP_URL_KEY, url)
   // Simpan juga ke file tahan-reset agar koneksi tidak hilang saat DB/server ter-reset
   persistUrlToBridge(url)
   console.log('[sheet-bridge] koneksi Google Sheet tersimpan (DB + sheet-bridge.json)')
@@ -630,7 +629,7 @@ export async function saveSheetUrl(rawUrl: string): Promise<void> {
 
 /** Hapus koneksi ke Google Sheet (DB + file tahan-reset) */
 export async function clearSheetUrl(): Promise<void> {
-  await db.syncMeta.deleteMany({ where: { key: WEBAPP_URL_KEY } })
+  await deleteMeta(WEBAPP_URL_KEY)
   persistUrlToBridge(null)
 }
 
@@ -650,7 +649,7 @@ export async function pushPendingToSheet(): Promise<PushResult> {
     return { ok: false, skipped: true, error: 'Google Sheet belum terhubung (Web App URL belum diisi)' }
   }
 
-  const pending = await db.localUpdate.findMany({ where: { sheetSynced: false } })
+  const pending = await readPendingLocals()
   if (pending.length === 0) return { ok: true, pushed: 0 }
 
   const ctrl = new AbortController()
@@ -687,14 +686,7 @@ export async function pushPendingToSheet(): Promise<PushResult> {
       : pending
 
     if (rowsToMark.length > 0) {
-      await db.$transaction(
-        rowsToMark.map((p) =>
-          db.localUpdate.update({
-            where: { harike_nama: { harike: p.harike, nama: p.nama } },
-            data: { sheetSynced: true },
-          }),
-        ),
-      )
+      await markLocalsSynced(rowsToMark.map((p) => ({ harike: p.harike, nama: p.nama })))
     }
 
     // Perbarui cermin cadangan (baris yang masih tertunda setelah pengiriman)
@@ -751,7 +743,7 @@ export async function autoPushOnce(trigger: string): Promise<PushResult | null> 
     autoPushGlobal.__tilawahAutoPushBusy = true
     const url = await getBridgeUrl()
     if (!url) return null
-    const pending = await db.localUpdate.count({ where: { sheetSynced: false } })
+    const pending = await countPendingLocals()
     if (pending === 0) return null
 
     autoPushGlobal.__tilawahAutoPushLast = now
@@ -799,15 +791,7 @@ export async function saveProgress(
     throw new Error('Tidak ada perubahan valid untuk disimpan')
   }
 
-  await db.$transaction(
-    valid.map((u) =>
-      db.localUpdate.upsert({
-        where: { harike_nama: { harike: u.harike, nama: u.nama } },
-        create: { harike: u.harike, nama: u.nama, status: u.status, sheetSynced: false },
-        update: { status: u.status, sheetSynced: false },
-      }),
-    ),
-  )
+  await upsertLocals(valid)
 
   // Pantarkan update tertunda ke file tahan-reset SEBELUM mencoba push
   await mirrorPendingToBridge()

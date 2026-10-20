@@ -75,3 +75,22 @@ Stage Summary:
 - Koneksi Google Sheet kini TAHAN RESET: tersimpan di DB + sheet-bridge.json (+ env SHEET_WEBAPP_URL opsional); bila DB ter-reset, koneksi pulih otomatis tanpa "Hubungkan Sheet" ulang.
 - Update tertunda dipantarkan ke file dan dipulihkan otomatis; auto-push tiap ±1 menit memastikan semua perubahan akhirnya tertulis di Google Sheet tanpa aksi manual.
 - Satu-satunya setup yang tersisa bagi admin: deploy Apps Script + tempel URL sekali (dialog Hubungkan Sheet); setelah itu tidak pernah diminta lagi.
+
+---
+Task ID: Deploy 1
+Agent: Z.ai Code (main agent)
+Task: Persiapan deploy aplikasi ke Vercel + panduan langkah demi langkah (permintaan user: "Saya mau deploy aplikasi ini di Vercel. Tlg dipandu.")
+
+Work Log:
+- Analisis hambatan Vercel: (1) SQLite tidak bisa MENULIS di filesystem serverless Vercel (read-only/ephemeral) — padahal app menulis LocalUpdate + cache sync; (2) sheet-bridge.json ditulis ke project root (read-only di Vercel); (3) build script package.json masih gaya self-host standalone; (4) penulisan Apps Script 20 detik bisa terpotong timeout default function.
+- Baru: src/lib/tilawah-store.ts — lapisan data resilient. Semua operasi Prisma dibungkus tryDb(): mode DB (lokal) berperilaku sama persis; mode memori otomatis aktif bila VERCEL=1 (atau TILAWAH_NO_DB=1) atau bila query DB gagal (cooldown 10 menit). Fungsi: get/set/deleteMeta, countEntries, readAllEntries, replaceAllEntries, readAllLocals, readPendingLocals, countPendingLocals, upsertLocals, markLocalsSynced, restoreLocalsIfEmpty.
+- Refactor penuh src/lib/tilawah-server.ts: seluruh akses db.* diganti panggilan store (tidak ada lagi import db); BRIDGE_FILE pindah ke /tmp saat VERCEL=1 (root project di lokal). Logika bisnis (sync 3 menit, merge overlay, push Apps Script, auto-push, bridge self-heal DB→file→env) tidak berubah.
+- Konfigurasi build Vercel: package.json → build = "next build" murni, standalone dipindah ke build:standalone, tambah postinstall "prisma generate"; next.config.ts → output standalone hanya non-Vercel; semua 6 API route diberi export const maxDuration = 60; src/lib/db.ts → fallback datasourceUrl file:/tmp/tilawah-fallback.db; .gitignore += sheet-bridge.json & /tool-results/.
+- Pengujian: (1) Simulasi Vercel — VERCEL=1 TILAWAH_NO_DB=1 bun .zscripts/test-vercel-mode.ts: sync sheet OK (189 baris/21 hari/9 peserta), buildDashboard OK, saveProgress → overlay memori OK (source=app), push benar ter-skip saat belum terhubung, settings pendingCount=1 → SEMUA LULUS; (2) mode DB normal via dev server: /api/dashboard 200 (133/189, 70%, hari ke-21 target 11A), query Prisma jalan; (3) tsc --noEmit: src/ tanpa error (sisa error hanya di examples/, skills/, tool-results/ bawaan); (4) lint bersih.
+- E2E agent-browser: dashboard render (hero hari ke-21 20 Okt 2026, 133/189 70%), Update Progress → ubah Daniel Abbas Belum→Selesai → Simpan → popup "Barokallahu fii kum" + status penulisan Sheet, Kembali ke Dashboard → Capaian Hari Ini 1/9, Juz 67 juz, aktivitas "Daniel Abbas → Selesai ... via app"; console tanpa error page. Data uji direset (LocalUpdate dikosongkan, 133/189 & 0/9).
+- Dokumen: DEPLOY.md — panduan 4 langkah (push GitHub → import Vercel → env vars → verifikasi), tabel troubleshooting, catatan teknis, opsi migrasi DB eksternal di masa depan (TILAWAH_FORCE_DB=1).
+
+Stage Summary:
+- Repo SIAP DEPLOY ke Vercel tanpa perubahan perilaku di lokal: di Vercel Google Sheet menjadi satu-satunya penyimpanan permanen (jadwal via CSV export; status ditulis langsung via Apps Script write-through), sehingga ephemeral-nya serverless tidak menyebabkan kehilangan data.
+- Kunci koneksi permanen di Vercel = env var SHEET_WEBAPP_URL (sudah didukung rantai self-heal DB → file → env); DATABASE_URL=file:/tmp/tilawah.db opsional.
+- Pengguna tinggal ikuti DEPLOY.md: push ke GitHub, import di vercel.com/new, isi SHEET_WEBAPP_URL (+DATABASE_URL opsional), Deploy, verifikasi write-through ke Sheet.
